@@ -1,7 +1,6 @@
 class Validator {
   constructor() {
     this._errors = [];
-    this._known_types = ['number', 'boolean', 'string', 'array', 'object'];
     this._failed = false;
     this._handlers = new Map();
     this._string_patterns = {
@@ -9,20 +8,28 @@ class Validator {
       'date': str => /\d{4}-\d{2}-\d{2}$/.test(str) // YYYY-DD-MM
     };
 
-    // Generic handlers for possible values
-    this.bindHandler('[object Object]', this.isValidObject);
-    this.bindHandler('[object Array]', this.isValidArray);
-    this.bindHandler('[object Number]', (schema, oNum) => this.isValidNumber(schema, Number(oNum)));
-    this.bindHandler('[object Boolean]', (schema, oNum) => this.isValidBoolean(schema, Boolean(oNum)));
-    this.bindHandler('[object String]', (schema, oNum) => this.isValidString(schema, String(oNum)));
+    // Registering handlers
+    this.bindHandler('object', '[object Object]', this.isValidObject);
+    this.bindHandler('array', '[object Array]', this.isValidArray);
+    this.bindHandler('number', '[object Number]', this.isValidNumber);
+    this.bindHandler('boolean', '[object Boolean]', (schema, bool) => { /* Nothing to do with boolean */ });
+    this.bindHandler('string', '[object String]', this.isValidString);
   }
 
   get Errors() {
     return this._errors;
   }
 
-  bindHandler(type, handler) {
-    this._handlers.set(type, handler.bind(this));
+  bindHandler(typeName, type, handler) {
+    this._handlers.set(
+      typeName,
+      (scheme, data) => {
+        if (type === Object.prototype.toString.call(data)) {
+          handler.bind(this)(scheme, data);
+        } else {
+          this.fail('Type is incorrect');
+        }
+      });
   }
 
   pushError(err) {
@@ -35,7 +42,7 @@ class Validator {
     }
     this._failed = true;
   }
-  
+
   // Equality check by value
   compareValues(a, b) {
     if (this.isObject(a) && this.isObject(b)) {
@@ -70,30 +77,18 @@ class Validator {
     return obj != null && typeof obj === 'object';
   }
 
-  isValidType(given, expected) {
-    if (given !== expected) {
-      this.fail('Type is incorrect');
-    }
-  }
-
   isValidNumber(schema, number) {
-    this.isValidType(schema.type, 'number');
     this.testProperty(schema.minimum, p => p <= number, 'Value is less than it can be');
     this.testProperty(schema.maximum, p => p >= number, 'Value is greater than it can be');
     this.testProperty(schema.enum, p => p.includes(number), 'The enum does not support value');
   }
 
   isValidString(schema, str) {
-    this.isValidType(schema.type, 'string');
     this.testProperty(schema.minLength, p => p <= str.length, 'Too short string');
     this.testProperty(schema.maxLength, p => p >= str.length, 'Too long string');
     this.testProperty(schema.pattern, p => p.test(str), 'String does not match pattern');
     this.testProperty(schema.enum, p => p.includes(str), 'The enum does not support value');
     this.testProperty(schema.format, p => this._string_patterns[p](str), 'Format of string is not valid');
-  }
-
-  isValidBoolean(schema, bool) {
-    this.isValidType(schema.type, 'boolean')
   }
 
   isUniqueArray(arr) {
@@ -110,7 +105,6 @@ class Validator {
   }
 
   isValidArray(schema, arr) {
-    this.isValidType(schema.type, 'array');
     this.testProperty(schema.minItems, p => p <= arr.length, 'Items count less than can be');
     this.testProperty(schema.maxItems, p => p >= arr.length, 'Items count more than can be');
     this.testProperty(schema.contains, p => arr.some(item => this.compareValues(item, p)), 'Must contain a value, but does not');
@@ -128,16 +122,15 @@ class Validator {
   }
 
   isValidObject(schema, obj) {
-    this.isValidType(schema.type, 'object');
     this.testProperty(schema.minProperties, p => p <= Object.keys(obj).length, 'Too few properties in object');
     this.testProperty(schema.maxProperties, p => p >= Object.keys(obj).length, 'Too many properties in object');
     this.testProperty(schema.required, p => p.every(item => obj[item]), 'Property required, but value is undefined');
     this.testProperty(schema.properties, properties => {
       // Array of accepted properties
       const schemes = Object.keys(properties);
-      // If every object's property corresponds to it's scheme property
+      // If every object's property corresponds to its scheme property
       if (schemes.every(propName => this.isValid(properties[propName], obj[propName]))) {
-        // Also if additional properties is true or the object has no other properties
+        // Also if 'additionalProperties' is true or the object has no other properties
         if (schema.additionalProperties || schemes.length === Object.keys(obj).length) {
           // Test OK
           return true;
@@ -149,8 +142,25 @@ class Validator {
     }, 'Type is incorrect');
   }
 
-  filterSchemas(schemas, data) {
-    return schemas.filter(s => new Validator().isValid(s, data));
+  testSingleScheme(scheme, data) {
+    // Mapping handler 
+    const handler = this._handlers.get(scheme.type);
+
+    if (handler) {
+      handler(scheme, data);
+    } else {
+      this.fail('Unknown type');
+    }
+  }
+
+  testMultipleSchemes(schemes, data, onlyOne) {
+    const filtered = schemes.filter(s => new Validator().isValid(s, data));
+
+    if (filtered.length === 0) {
+      this.fail('None schemas are valid');
+    } else if (onlyOne && filtered.length !== 1) {
+      this.fail('More than one shema valid for this data');
+    }
   }
 
   /**
@@ -160,33 +170,17 @@ class Validator {
    * @returns {boolean}
    */
   isValid(schema = {}, dataToValidate) {
+    // Taking array of possible schemes
     const schemaVariants = schema.anyOf || schema.oneOf;
-
-    // If there's an array of possible schemes
-    if (schemaVariants) {
-      const filtered = this.filterSchemas(schemaVariants, dataToValidate);
-
-      if (filtered.length === 0) {
-        this.fail('None schemas are valid');
-      } else if (schema.oneOf) {
-        if (filtered.length !== 1) {
-          this.fail('More than one shema valid for this data');
-        }
+    
+    if (dataToValidate === null) {
+      if (!schema.nullable) {
+        this.fail('Value is null, but nullable false');
       }
-    } else if (dataToValidate !== null) {
-      // Using [object Type] to get the exact type of 'dataToValidate'
-      // Mapping its type to a handler
-      const type = Object.prototype.toString.call(dataToValidate);
-      const handler = this._handlers.get(type);
-
-      if (handler && this._known_types.includes(schema.type)) {
-        // Call specific data handler
-        handler(schema, dataToValidate);
-      } else {
-        this.fail('Unknown type');
-      }
-    } else if (!schema.nullable) {
-      this.fail('Value is null, but nullable false');
+    } else if (schemaVariants) {
+      this.testMultipleSchemes(schemaVariants, dataToValidate, schema.oneOf);
+    } else {
+      this.testSingleScheme(schema, dataToValidate);
     }
 
     return !this._failed;
